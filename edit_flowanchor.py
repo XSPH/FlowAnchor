@@ -244,8 +244,9 @@ def flowanchor_edit(
         arg_tgt = {'context': context_tgt, 'seq_len': seq_len}
         arg_null = {'context': context_null, 'seq_len': seq_len}
 
-        start_latents = latents
-        mv_latent = latents.clone()
+        # Ensure latents is a list of tensors and clone per-element.
+        start_latents = latents if isinstance(latents, list) else [latents]
+        mv_latent = [t.clone() for t in start_latents]
 
         for i, t in enumerate(timesteps):
             noise = [torch.randn(target_shape[0], target_shape[1],
