@@ -17,8 +17,7 @@ outputs/
 # Data files
 date/
 
-# FiVE-Bench is a separate repo
-FiVE-Bench/
+# FiVE-Bench is now a git submodule
 
 # Video files
 *.mp4
