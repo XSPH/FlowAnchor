@@ -1,5 +1,15 @@
 """
 FlowAnchor: Batch evaluation on FiVE-Bench dataset
+
+FiVE-Bench data layout (see FiVE-Bench/README.md):
+    data/
+    ├── edit_prompt/edit{1..6}_FiVE.json   (video_name / source_prompt / target_prompt)
+    ├── videos/<video_name>.mp4
+    └── bmasks/<video_name>/*.jpg          (per-frame binary masks)
+
+FlowAnchor uses the benchmark masks as the SAR spatial anchor (paper Table 1,
+mask-based method) and auto-derives the target words J_tar from the
+source/target prompt diff.
 """
 import argparse
 import json
@@ -14,7 +24,8 @@ warnings.filterwarnings('ignore')
 import torch
 import psutil
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'FiVE-Bench', 'models', 'wan-edit'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'FiVE-Bench', 'models', 'wan-edit'))
 from wan.utils.utils import str2bool
 from edit_flowanchor import (
     load_frames, load_frames_path, load_mask, flowanchor_edit, _init_logging
@@ -31,19 +42,29 @@ def parse_args():
     parser.add_argument("--ckpt_dir", type=str, required=True)
     parser.add_argument("--offload_model", type=str2bool, default=True)
     parser.add_argument("--t5_cpu", action="store_true", default=False)
-    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument("--data_dir", type=str, default="data/videos",
+                        help="Directory containing <video_name>.mp4 files.")
+    parser.add_argument("--mask_dir", type=str, default=None,
+                        help="Directory containing <video_name>/ mask frames; "
+                             "defaults to <data_dir>/../bmasks (FiVE layout).")
     parser.add_argument("--save_dir", type=str, default="outputs_flowanchor")
     parser.add_argument("--FiVE_dataset_json", type=str, required=True)
-    parser.add_argument("--sample_solver", type=str, default='unipc')
-    parser.add_argument("--sample_steps", type=int, default=50)
+    # Sampling (paper Sec. B: T=25, skip 2, Euler / Eq. 13)
+    parser.add_argument("--sample_solver", type=str, default='euler',
+                        choices=['euler', 'unipc'])
+    parser.add_argument("--sample_steps", type=int, default=25)
     parser.add_argument("--sample_shift", type=float, default=5.0)
     parser.add_argument("--sample_guide_scale", type=float, default=5.0)
     parser.add_argument("--tgt_guide_scale", type=float, default=10.0)
-    parser.add_argument("--skip_timesteps", type=int, default=16)
-    parser.add_argument("--base_seed", type=int, default=-1)
-    parser.add_argument("--beta1", type=float, default=0.5)
-    parser.add_argument("--beta2", type=float, default=0.5)
-    parser.add_argument("--gamma_scale", type=float, default=1.0)
+    parser.add_argument("--skip_timesteps", type=int, default=2)
+    parser.add_argument("--base_seed", type=int, default=42)
+    # FlowAnchor hyperparameters (paper: beta1=beta2=0.3, gamma=1.0, tau=0.6, F0=21)
+    parser.add_argument("--beta1", type=float, default=0.3)
+    parser.add_argument("--beta2", type=float, default=0.3)
+    parser.add_argument("--gamma", "--gamma_scale", dest="gamma", type=float, default=1.0)
+    parser.add_argument("--f0", type=int, default=21)
+    parser.add_argument("--sar_tau", type=float, default=0.6)
+    parser.add_argument("--no_sar", action="store_true", default=False)
     parser.add_argument("--eval_gpu_time", action="store_true", default=False)
     return parser.parse_args()
 
@@ -55,6 +76,9 @@ def main():
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+
+    if args.mask_dir is None:
+        args.mask_dir = os.path.join(os.path.dirname(args.data_dir.rstrip('/')), 'bmasks')
 
     if args.offload_model is None:
         args.offload_model = world_size <= 1
@@ -104,9 +128,7 @@ def main():
         print(f"[{vid}/{num_videos}] {video_name}: {src_prompt} -> {tgt_prompt}")
 
         try:
-            if video_path.endswith('.mp4'):
-                video = load_frames(video_path, num_frames=args.frame_num, target_size=target_size)
-            elif os.path.isdir(video_path):
+            if os.path.isdir(video_path):
                 video = load_frames_path(video_path, num_frames=args.frame_num, target_size=target_size)
             else:
                 video = load_frames(video_path, num_frames=args.frame_num, target_size=target_size)
@@ -114,13 +136,20 @@ def main():
             actual_frames = video.shape[2]
             seed = args.base_seed if args.base_seed >= 0 else torch.randint(0, 2**31, (1,)).item()
 
+            mask = None
+            if not args.no_sar:
+                mask_path = os.path.join(args.mask_dir, video_name)
+                mask = load_mask(mask_path, actual_frames, target_size)
+                if mask is None:
+                    print(f"  Warning: no mask at {mask_path}; SAR disabled for this video.")
+
             video_out = flowanchor_edit(
                 wan_pipeline=wan_t2v,
                 video=video,
                 src_prompt=src_prompt,
                 tgt_prompt=tgt_prompt,
-                mask=None,
-                target_words=None,
+                mask=mask,
+                target_words=None,  # auto-derived from the prompt diff
                 size=target_size,
                 frame_num=actual_frames,
                 shift=args.sample_shift,
@@ -133,7 +162,10 @@ def main():
                 offload_model=args.offload_model,
                 beta1=args.beta1,
                 beta2=args.beta2,
-                gamma_scale=args.gamma_scale,
+                gamma=args.gamma,
+                f0=args.f0,
+                sar_tau=args.sar_tau,
+                no_sar=args.no_sar,
                 device=torch.device(f"cuda:{device}"),
             )
 

@@ -1,6 +1,14 @@
 """
-FlowAnchor: Full editing pipeline on top of Wan-Edit
-Integrates SAR and AMM into the Wan T2V editing workflow
+FlowAnchor: Full editing pipeline on top of Wan-Edit (arXiv 2604.22586, Alg. 1)
+
+Follows the paper's implementation details (supplementary Sec. B):
+  * T = 25 inference steps, first 2 skipped (n_max = 23), n_avg = 1;
+  * explicit Euler trajectory update Z_edit += (t_{i-1} - t_i) * dV (Eq. 13),
+    on the shift-5 rectified-flow sigma grid;
+  * source/target latents built with the CURRENT t_i (Alg. 1 line 5);
+  * SAR modulates CA logits of all layers, only inside the target-conditional
+    velocity forward, while t_i >= tau (tau = 0.6);
+  * AMM applied to the editing signal at every step (mask-free).
 """
 import argparse
 import gc
@@ -23,7 +31,7 @@ import torch.cuda.amp as amp
 import wan
 from wan.configs import WAN_CONFIGS, SIZE_CONFIGS
 from wan.utils.utils import cache_video, str2bool
-from flowanchor import FlowAnchorEditor
+from flowanchor import FlowAnchorEditor, SARController
 
 
 def load_frames(video_path=None, num_frames=41, target_size=(832, 480)):
@@ -62,6 +70,7 @@ def load_frames_path(video_path=None, num_frames=41, target_size=(832, 480)):
 
 
 def load_mask(mask_path: str, num_frames: int, target_size: Tuple[int, int]) -> Optional[torch.Tensor]:
+    """Load a pixel-space binary mask as [1, 1, F, H, W] (values 0/1)."""
     if mask_path is None:
         return None
 
@@ -76,7 +85,9 @@ def load_mask(mask_path: str, num_frames: int, target_size: Tuple[int, int]) -> 
             m = cv2.resize(m, target_size)
             masks.append((m > 127).astype(np.float32))
         if masks:
-            return torch.tensor(np.array(masks)).float().permute(1, 0, 2, 3).unsqueeze(0)
+            while len(masks) < num_frames:  # repeat last frame if mask is short
+                masks.append(masks[-1])
+            return torch.tensor(np.array(masks)).float()[None, None]
 
     elif mask_path.endswith('.mp4'):
         cap = cv2.VideoCapture(mask_path)
@@ -90,66 +101,19 @@ def load_mask(mask_path: str, num_frames: int, target_size: Tuple[int, int]) -> 
             masks.append((gray > 127).astype(np.float32))
         cap.release()
         if masks:
-            return torch.tensor(np.array(masks)).float().permute(1, 0, 2, 3).unsqueeze(0)
+            while len(masks) < num_frames:
+                masks.append(masks[-1])
+            return torch.tensor(np.array(masks)).float()[None, None]
 
     elif mask_path.endswith(('.png', '.jpg')):
         m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         if m is not None:
             m = cv2.resize(m, target_size)
             m = (m > 127).astype(np.float32)
-            mask_tensor = torch.tensor(m).float().unsqueeze(0).unsqueeze(0)
-            return mask_tensor.expand(1, 1, num_frames, -1, -1)
+            mask_tensor = torch.tensor(m).float()[None, None, None]
+            return mask_tensor.expand(1, 1, num_frames, -1, -1).contiguous()
 
     return None
-
-
-class SARCrossAttentionHook:
-    """Hook that applies SAR refinement to cross-attention during forward pass."""
-
-    def __init__(self, editor: FlowAnchorEditor, mask: torch.Tensor,
-                 target_indices: List[int]):
-        self.editor = editor
-        self.mask = mask
-        self.target_indices = target_indices
-        self.handles = []
-
-    def register(self, model):
-        for block in model.blocks:
-            if hasattr(block, 'cross_attn'):
-                h = block.cross_attn.register_forward_hook(self._hook)
-                self.handles.append(h)
-
-    def remove(self):
-        for h in self.handles:
-            h.remove()
-        self.handles.clear()
-
-    def _hook(self, module, inp, output):
-        if not (hasattr(module, 'q') and hasattr(module, 'k')):
-            return output
-        q_raw = module.norm_q(module.q(inp[0]))
-        k_raw = module.norm_k(module.k(inp[1]))
-        B, L_v, n, d = q_raw.shape
-        L_t = k_raw.shape[1]
-        q = q_raw.reshape(B, L_v, n, d)
-        k = k_raw.reshape(B, L_t, n, d)
-
-        ca_weights = torch.einsum('bind,bjnd->bijn', q, k) / (d ** 0.5)
-        ca_weights = torch.softmax(ca_weights, dim=-1)
-
-        refined_ca = self.editor.spatial_aware_attention_refinement(
-            ca_weights, self.mask, self.target_indices)
-
-        diff = refined_ca - ca_weights
-        modulated_k = k + torch.einsum('bijn,bjnd->bjnd', diff, k)
-
-        from wan.modules.attention import flash_attention
-        v = module.v(inp[1])
-        x = flash_attention(q, modulated_k.reshape(B, L_t, n, d),
-                            v.reshape(B, L_t, n, d), k_lens=None)
-        x = x.flatten(2)
-        x = module.o(x)
-        return x
 
 
 def flowanchor_edit(
@@ -161,32 +125,36 @@ def flowanchor_edit(
     target_words: Optional[List[str]],
     size: Tuple[int, int],
     frame_num: int,
-    shift: float,
-    sample_solver: str,
-    sampling_steps: int,
-    guide_scale: float,
-    tgt_guide_scale: float,
-    skip_timesteps: int,
-    seed: int,
-    offload_model: bool,
-    beta1: float,
-    beta2: float,
-    gamma_scale: float,
-    device: torch.device,
+    shift: float = 5.0,
+    sample_solver: str = 'euler',
+    sampling_steps: int = 25,
+    guide_scale: float = 5.0,
+    tgt_guide_scale: float = 10.0,
+    skip_timesteps: int = 2,
+    seed: int = -1,
+    offload_model: bool = True,
+    beta1: float = 0.3,
+    beta2: float = 0.3,
+    gamma: float = 1.0,
+    f0: int = 21,
+    sar_tau: float = 0.6,
+    no_sar: bool = False,
+    device: torch.device = torch.device('cuda'),
 ) -> torch.Tensor:
     F = frame_num
     video = video.to(device)
     latents = wan_pipeline.vae.encode(video)
-    target_shape = (
-        wan_pipeline.vae.model.z_dim,
-        (F - 1) // wan_pipeline.vae_stride[0] + 1,
-        size[1] // wan_pipeline.vae_stride[1],
-        size[0] // wan_pipeline.vae_stride[2],
-    )
+    start_latents = latents if isinstance(latents, list) else [latents]
+    x_src = start_latents[0].float()                    # [C, F', H/8, W/8]
+
+    lat_c, lat_f, lat_h, lat_w = x_src.shape
+    patch_f, patch_h, patch_w = wan_pipeline.patch_size
+    tok_f = lat_f // patch_f
+    tok_h = lat_h // patch_h
+    tok_w = lat_w // patch_w
+    num_video_tokens = tok_f * tok_h * tok_w
     seq_len = math.ceil(
-        (target_shape[2] * target_shape[3])
-        / (wan_pipeline.patch_size[1] * wan_pipeline.patch_size[2])
-        * target_shape[1] / wan_pipeline.sp_size
+        (lat_h * lat_w) / (patch_h * patch_w) * lat_f / wan_pipeline.sp_size
     ) * wan_pipeline.sp_size
 
     seed_g = torch.Generator(device=device)
@@ -204,16 +172,34 @@ def flowanchor_edit(
         context_tgt = [t.to(device) for t in wan_pipeline.text_encoder([tgt_prompt], torch.device('cpu'))]
         context_null = [t.to(device) for t in wan_pipeline.text_encoder([wan_pipeline.sample_neg_prompt], torch.device('cpu'))]
 
-    editor = FlowAnchorEditor(device=device, beta1=beta1, beta2=beta2, gamma_scale=gamma_scale)
+    editor = FlowAnchorEditor(device=device, beta1=beta1, beta2=beta2,
+                              gamma=gamma, f0=f0, sar_tau=sar_tau)
 
-    target_token_indices = None
-    if target_words:
-        target_token_indices = editor.find_target_token_indices(tgt_prompt, target_words)
-        logging.info(f"SAR target token indices: {target_token_indices}")
-
-    mask_on_device = mask.to(device) if mask is not None else None
-
-    use_sar = (target_token_indices is not None and mask_on_device is not None)
+    # ---------------- SAR setup ---------------- #
+    sar_controller = None
+    if not no_sar and mask is not None:
+        if not target_words:
+            target_words = editor.derive_target_words(src_prompt, tgt_prompt)
+            logging.info(f"SAR target words (auto-derived): {target_words}")
+        tokenizer = wan_pipeline.text_encoder.tokenizer
+        target_token_indices = editor.find_target_token_indices(
+            tgt_prompt, target_words, tokenizer)
+        if target_token_indices:
+            logging.info(f"SAR target token indices (umT5): {target_token_indices}")
+            mask_flat = editor.downsample_mask_to_latent(
+                mask.to(device), tok_f, tok_h, tok_w)
+            sar_controller = SARController(
+                editor=editor,
+                mask_flat=mask_flat,
+                target_indices=target_token_indices,
+                text_len=context_tgt[0].shape[0],
+                num_video_tokens=num_video_tokens,
+            )
+        else:
+            logging.warning(
+                "SAR disabled: could not map target words to token indices.")
+    elif not no_sar:
+        logging.warning("SAR disabled: no mask provided.")
 
     @contextmanager
     def noop_no_sync():
@@ -222,79 +208,73 @@ def flowanchor_edit(
     no_sync = getattr(wan_pipeline.model, 'no_sync', noop_no_sync)
 
     with amp.autocast(dtype=wan_pipeline.param_dtype), torch.no_grad(), no_sync():
-        if sample_solver == 'unipc':
-            from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-            sample_scheduler = FlowUniPCMultistepScheduler(
-                num_train_timesteps=wan_pipeline.num_train_timesteps,
-                shift=1, use_dynamic_shifting=False)
-            sample_scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
-            timesteps = sample_scheduler.timesteps
-        elif sample_solver == 'dpm++':
-            from wan.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
-                                              get_sampling_sigmas, retrieve_timesteps)
-            sample_scheduler = FlowDPMSolverMultistepScheduler(
-                num_train_timesteps=wan_pipeline.num_train_timesteps,
-                shift=1, use_dynamic_shifting=False)
-            sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
-            timesteps, _ = retrieve_timesteps(sample_scheduler, device=device, sigmas=sampling_sigmas)
-        else:
-            raise NotImplementedError("Unsupported solver.")
+        # Rectified-flow sigma grid (shift-5, T steps + terminal 0), shared by
+        # both solvers.  Following FlowEdit / Alg. 1, the trajectory update
+        # itself is explicit Euler; 'unipc' is kept only as the legacy
+        # Wan-Edit-style update for comparison.
+        from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+        sample_scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=wan_pipeline.num_train_timesteps,
+            shift=1, use_dynamic_shifting=False)
+        sample_scheduler.set_timesteps(sampling_steps, device=device, shift=shift)
+        timesteps = sample_scheduler.timesteps
+        sigmas = sample_scheduler.sigmas          # length T+1, ends at 0
 
         arg_src = {'context': context_src, 'seq_len': seq_len}
         arg_tgt = {'context': context_tgt, 'seq_len': seq_len}
         arg_null = {'context': context_null, 'seq_len': seq_len}
 
-        # Ensure latents is a list of tensors and clone per-element.
-        start_latents = latents if isinstance(latents, list) else [latents]
-        mv_latent = [t.clone() for t in start_latents]
+        wan_pipeline.model.to(device)
+        if sar_controller is not None:
+            sar_controller.patch(wan_pipeline.model)
 
-        for i, t in enumerate(timesteps):
-            noise = [torch.randn(target_shape[0], target_shape[1],
-                                 target_shape[2], target_shape[3],
-                                 dtype=torch.float32, device=device)]
+        zt_edit = x_src.clone()                              # Alg. 1 line 1
+        try:
+            for i, t in enumerate(timesteps):
+                if i < skip_timesteps:                       # n_max = T - skip
+                    continue
 
-            if i < skip_timesteps:
-                continue
+                t_i = float(sigmas[i])
+                t_im1 = float(sigmas[i + 1])
+                timestep = torch.stack([t])
 
-            t_prev = 1000 if i == 0 else timesteps[i - 1]
-            src_latent = [t_prev / 1000.0 * noise[0] + (1000 - t_prev) / 1000.0 * start_latents[0]]
-            tgt_latent = [mv_latent[0] + src_latent[0] - start_latents[0]]
+                noise = torch.randn(
+                    x_src.shape, generator=seed_g,
+                    dtype=torch.float32, device=device)
+                zt_src = (1.0 - t_i) * x_src + t_i * noise   # Alg. 1 line 5
+                zt_tar = zt_edit + zt_src - x_src            # Alg. 1 line 6
 
-            timestep = torch.stack([t])
-            wan_pipeline.model.to(device)
+                # V_tar: SAR active only here, and only while t_i >= tau
+                if sar_controller is not None:
+                    sar_controller.active = t_i >= sar_tau
+                v_cond_tgt = wan_pipeline.model([zt_tar], t=timestep, **arg_tgt)[0]
+                if sar_controller is not None:
+                    sar_controller.active = False
 
-            sar_hook = None
-            if use_sar:
-                sar_hook = SARCrossAttentionHook(editor, mask_on_device, target_token_indices)
-                sar_hook.register(wan_pipeline.model)
+                v_uncond_tgt = wan_pipeline.model([zt_tar], t=timestep, **arg_null)[0]
+                v_cond_src = wan_pipeline.model([zt_src], t=timestep, **arg_src)[0]
+                v_uncond_src = wan_pipeline.model([zt_src], t=timestep, **arg_null)[0]
 
-            noise_pred_cond_src = wan_pipeline.model(src_latent, t=timestep, **arg_src)[0]
-            noise_pred_cond_tgt = wan_pipeline.model(tgt_latent, t=timestep, **arg_tgt)[0]
+                v_src = v_uncond_src + guide_scale * (v_cond_src - v_uncond_src)
+                v_tar = v_uncond_tgt + tgt_guide_scale * (v_cond_tgt - v_uncond_tgt)
+                delta_v = (v_tar - v_src).float()            # Alg. 1 line 9
 
-            if sar_hook is not None:
-                sar_hook.remove()
+                delta_v = editor.adaptive_magnitude_modulation(delta_v)  # line 10
 
-            noise_pred_uncond_src = wan_pipeline.model(src_latent, t=timestep, **arg_null)[0]
-            noise_pred_uncond_tgt = wan_pipeline.model(tgt_latent, t=timestep, **arg_null)[0]
+                if sample_solver == 'euler':
+                    zt_edit = zt_edit + (t_im1 - t_i) * delta_v          # Eq. 13
+                elif sample_solver == 'unipc':
+                    zt_edit = sample_scheduler.step(
+                        delta_v.unsqueeze(0), t, zt_edit.unsqueeze(0),
+                        return_dict=False, generator=seed_g)[0].squeeze(0)
+                else:
+                    raise NotImplementedError(
+                        f"Unsupported solver: {sample_solver}")
+        finally:
+            if sar_controller is not None:
+                sar_controller.unpatch()
 
-            noise_pred_src = noise_pred_uncond_src + guide_scale * (
-                noise_pred_cond_src - noise_pred_uncond_src)
-            noise_pred_tgt = noise_pred_uncond_tgt + tgt_guide_scale * (
-                noise_pred_cond_tgt - noise_pred_uncond_tgt)
-
-            delta_v = noise_pred_tgt - noise_pred_src
-
-            if mask_on_device is not None:
-                delta_v = editor.adaptive_magnitude_modulation(
-                    delta_v, mask_on_device, target_shape[1])
-
-            temp_x0 = sample_scheduler.step(
-                delta_v.unsqueeze(0), t,
-                mv_latent[0].unsqueeze(0),
-                return_dict=False, generator=seed_g)[0]
-            mv_latent = [temp_x0.squeeze(0)]
-
-        x0 = mv_latent
+        x0 = [zt_edit]
         if offload_model:
             wan_pipeline.model.cpu()
         if wan_pipeline.rank == 0:
@@ -325,17 +305,31 @@ def _parse_args():
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--tgt_prompt", type=str, required=True)
     parser.add_argument("--mask_path", type=str, default=None)
-    parser.add_argument("--target_words", type=str, nargs='+', default=None)
-    parser.add_argument("--sample_solver", type=str, default='unipc', choices=['unipc', 'dpm++'])
-    parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--target_words", type=str, nargs='+', default=None,
+                        help="Words in the target prompt driving the edit (J_tar); "
+                             "auto-derived from the prompt diff if omitted.")
+    # Sampling (paper Sec. B: T=25, skip first 2 steps, Euler update, shift 5)
+    parser.add_argument("--sample_solver", type=str, default='euler',
+                        choices=['euler', 'unipc'],
+                        help="'euler' = paper Alg. 1 / FlowEdit update (default); "
+                             "'unipc' = legacy Wan-Edit-style scheduler step.")
+    parser.add_argument("--sample_steps", type=int, default=25)
     parser.add_argument("--sample_shift", type=float, default=5.0)
     parser.add_argument("--sample_guide_scale", type=float, default=5.0)
     parser.add_argument("--tgt_guide_scale", type=float, default=10.0)
-    parser.add_argument("--skip_timesteps", type=int, default=16)
+    parser.add_argument("--skip_timesteps", type=int, default=2,
+                        help="Skipped leading steps = T - n_max (paper: 25 - 23 = 2).")
     parser.add_argument("--base_seed", type=int, default=-1)
-    parser.add_argument("--beta1", type=float, default=0.5)
-    parser.add_argument("--beta2", type=float, default=0.5)
-    parser.add_argument("--gamma_scale", type=float, default=1.0)
+    # FlowAnchor hyperparameters (paper: beta1=beta2=0.3, gamma=1.0, tau=0.6T, F0=21)
+    parser.add_argument("--beta1", type=float, default=0.3)
+    parser.add_argument("--beta2", type=float, default=0.3)
+    parser.add_argument("--gamma", "--gamma_scale", dest="gamma", type=float, default=1.0,
+                        help="AMM base amplification strength (0 disables AMM).")
+    parser.add_argument("--f0", type=int, default=21,
+                        help="Reference latent temporal length F0 (Eq. 28).")
+    parser.add_argument("--sar_tau", type=float, default=0.6,
+                        help="SAR active while normalized time t >= tau.")
+    parser.add_argument("--no_sar", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -365,9 +359,7 @@ def main():
         raise ValueError("Must specify --video_path or --video_name")
 
     target_size = tuple(int(x) for x in args.size.split('*'))
-    if args.video_path is not None and args.video_path.endswith('.mp4'):
-        video = load_frames(args.video_path, num_frames=args.frame_num, target_size=target_size)
-    elif os.path.isdir(video_path):
+    if os.path.isdir(video_path):
         video = load_frames_path(video_path, num_frames=args.frame_num, target_size=target_size)
     else:
         video = load_frames(video_path, num_frames=args.frame_num, target_size=target_size)
@@ -379,7 +371,9 @@ def main():
     if args.mask_path:
         mask = load_mask(args.mask_path, actual_frames, target_size)
         if mask is not None:
-            logging.info(f"Loaded mask: {mask.shape}")
+            logging.info(f"Loaded mask: {tuple(mask.shape)}")
+        else:
+            logging.warning(f"Failed to load mask from {args.mask_path}")
 
     if args.offload_model is None:
         args.offload_model = world_size <= 1
@@ -422,7 +416,10 @@ def main():
         offload_model=args.offload_model,
         beta1=args.beta1,
         beta2=args.beta2,
-        gamma_scale=args.gamma_scale,
+        gamma=args.gamma,
+        f0=args.f0,
+        sar_tau=args.sar_tau,
+        no_sar=args.no_sar,
         device=torch.device(f"cuda:{device}"),
     )
 
