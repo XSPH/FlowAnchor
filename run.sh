@@ -7,6 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WAN_EDIT_DIR="${WAN_EDIT_DIR:-$SCRIPT_DIR/FiVE-Bench/models/wan-edit}"
 CKPT_DIR="${CKPT_DIR:-$SCRIPT_DIR/checkpoints/Wan-AI/Wan2.1-T2V-1.3B}"
+SIZE="${SIZE:-832*480}"   # 竖屏视频用: SIZE=480*832 bash run.sh ...
 
 if [ $# -lt 3 ]; then
     echo "Usage: bash run.sh <video_path> <src_prompt> <tgt_prompt> [mask_path] [target_words...]"
@@ -33,7 +34,17 @@ echo "=== FlowAnchor: Inversion-Free Video Editing ==="
 echo "Source: $VIDEO_PATH"
 echo "Source prompt: $SRC_PROMPT"
 echo "Target prompt: $TGT_PROMPT"
-[ -n "$MASK_PATH" ] && echo "Mask: $MASK_PATH"
+if [ -n "$MASK_PATH" ]; then
+    echo "Mask: $MASK_PATH"
+else
+    echo ""
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "!!! 警告: 未提供 mask, SAR (论文核心模块 TTM+STM) 将被完全禁用 !!!"
+    echo "!!! 实际运行的是 Wan-Edit + AMM, 效果会远差于论文.              !!!"
+    echo "!!! 用 make_mask.py 生成 mask 后作为第 4 个参数传入.            !!!"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo ""
+fi
 [ ${#TARGET_WORDS[@]} -gt 0 ] && echo "Target words: ${TARGET_WORDS[*]}"
 echo ""
 
@@ -53,6 +64,7 @@ fi
 EXTRA_ARGS=""
 [ -n "$MASK_PATH" ] && EXTRA_ARGS="$EXTRA_ARGS --mask_path $MASK_PATH"
 [ ${#TARGET_WORDS[@]} -gt 0 ] && EXTRA_ARGS="$EXTRA_ARGS --target_words ${TARGET_WORDS[*]}"
+[ -n "$SEED" ] && EXTRA_ARGS="$EXTRA_ARGS --base_seed $SEED"   # SEED=42 bash run.sh ... 可复现
 
 export PYTHONPATH="$WAN_EDIT_DIR:$PYTHONPATH"
 
@@ -61,6 +73,7 @@ export PYTHONPATH="$WAN_EDIT_DIR:$PYTHONPATH"
 #   beta1=beta2=0.3, gamma=1.0, tau=0.6, F0=21.
 python "$SCRIPT_DIR/edit_flowanchor.py" \
     --task t2v-1.3B \
+    --size "$SIZE" \
     --ckpt_dir "$CKPT_DIR" \
     --video_path "$VIDEO_PATH" \
     --prompt "$SRC_PROMPT" \
