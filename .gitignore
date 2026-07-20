@@ -53,3 +53,9 @@ logs/
 build/
 dist/
 *.egg-info/
+
+# User-generated edit masks
+masks/
+
+# Paper PDFs
+*.pdf
